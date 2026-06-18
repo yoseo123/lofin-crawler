@@ -1,0 +1,428 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>정책 사이트 크롤링</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  </head>
+  <body>
+    <main class="wrap">
+      <section class="panel hero">
+        <h1>정책 사이트 크롤링</h1>
+        <p>지방재정365, 열린재정</p>
+      </section>
+
+      <section class="panel form-panel">
+        <form id="crawlForm" method="post">
+          <input name="csrf_token" type="hidden" value="{{ csrf_token }}" />
+          <fieldset>
+            <legend>검색 설정</legend>
+            <div class="grid">
+              <label>
+                검색어
+                <input name="keyword" type="text" value="{{ form_defaults.keyword }}" placeholder="비우면 전체 조회" />
+              </label>
+              <label>
+                데이터 출처
+                <select name="source">
+                  <option value="local" {% if form_defaults.source == "local" %}selected{% endif %}>지방재정365</option>
+                  <option value="central" {% if form_defaults.source == "central" %}selected{% endif %}>중앙정부(열린재정)</option>
+                </select>
+              </label>
+              <label class="source-local">
+                날짜
+                <input name="year" type="date" value="{{ form_defaults.year }}" />
+              </label>
+              <label class="source-central">
+                회계년
+                <select name="fiscal_year">
+                  {% for y in range(2018, 2027) %}
+                  <option value="{{ y }}" {% if form_defaults.fiscal_year == y|string %}selected{% endif %}>{{ y }}</option>
+                  {% endfor %}
+                </select>
+              </label>
+              <label class="source-local">
+                지역
+                <select name="region">
+                  {% set regions = ["전국", "서울", "부산", "대구", "인천", "광주", "대전", "울산", "세종", "경기", "강원", "충북", "충남", "전북", "전남", "경북", "경남", "제주"] %}
+                  {% for r in regions %}
+                  <option value="{{ r }}" {% if form_defaults.region == r %}selected{% endif %}>{{ r }}</option>
+                  {% endfor %}
+                </select>
+              </label>
+            </div>
+          </fieldset>
+          <fieldset>
+            <legend>출력 설정</legend>
+            <div class="grid">
+              <label>
+                갯수
+                <input name="limit" type="number" min="1" max="500000" value="{{ form_defaults.limit }}" />
+                <span class="hint">최대 500,000</span>
+              </label>
+              <label>
+                청크 크기
+                <input name="chunk_size" type="number" min="0" max="10000" value="{{ form_defaults.chunk_size }}" />
+                <span class="hint">0이면 단일 파일, 최대 10,000</span>
+              </label>
+              <label>
+                파일 형식
+                <select name="output_format">
+                  <option value="md" {% if form_defaults.output_format == "md" %}selected{% endif %}>Markdown</option>
+                  <option value="xlsx" {% if form_defaults.output_format == "xlsx" %}selected{% endif %}>XLSX</option>
+                  <option value="both" {% if form_defaults.output_format == "both" %}selected{% endif %}>Markdown + XLSX</option>
+                </select>
+              </label>
+              <label>
+                파일명
+                <input name="output" type="text" value="{{ form_defaults.output }}" placeholder="out.md" />
+              </label>
+              <label class="check">
+                <input name="headed" type="checkbox" {% if form_defaults.headed %}checked{% endif %} />
+                실행 화면 보기
+              </label>
+            </div>
+          </fieldset>
+          <div class="action-row">
+            <button id="runBtn" type="submit">크롤링 실행</button>
+            <button id="stopBtn" type="button" class="btn-stop" disabled>작업 중지</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel status live-status">
+        <strong id="liveStatusTitle">대기</strong>
+        <p id="liveStatusMessage">작업 대기 중입니다.</p>
+        <div class="progress-wrap" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <div id="liveProgressBar" class="progress-bar"></div>
+        </div>
+        <p id="liveProgressMeta" class="progress-meta">0%</p>
+        <p id="liveResult" class="live-result" hidden></p>
+        <a id="liveDownload" class="download" href="#" hidden></a>
+        <a id="liveXlsxDownload" class="download" href="#" hidden></a>
+        <a id="liveJsonDownload" class="download" href="#" hidden></a>
+        <a id="liveManifestDownload" class="download" href="#" hidden></a>
+        <p id="liveError" class="live-error" hidden></p>
+      </section>
+
+      {% if error %}
+      <section class="panel status error">
+        <strong>오류</strong>
+        <p>{{ error }}</p>
+      </section>
+      {% endif %}
+
+      {% if result %}
+      <section class="panel status ok">
+        <strong>완료</strong>
+        <p>{{ result.count }}건 저장됨</p>
+        {% if result.chunks %}
+        <p>파트 파일: {{ result.chunks }}개</p>
+        {% endif %}
+        <p>검색 색인: {{ result.indexed }}건 (스킵 {{ result.index_skipped }}건)</p>
+        <a class="download" href="{{ url_for('download', filename=result.file) }}">{{ result.file }} 다운로드</a>
+        {% if result.xlsx_file and result.xlsx_file != result.file %}
+        <a class="download" href="{{ url_for('download', filename=result.xlsx_file) }}">{{ result.xlsx_file }} 다운로드</a>
+        {% endif %}
+        <a class="download" href="{{ url_for('download', filename=result.json_file) }}">{{ result.json_file }} 다운로드</a>
+        {% if result.manifest_file %}
+        <a class="download" href="{{ url_for('download', filename=result.manifest_file) }}">{{ result.manifest_file }} 다운로드</a>
+        {% endif %}
+      </section>
+      {% endif %}
+
+      <section class="panel files">
+        <h2>최근 생성 파일</h2>
+        <ul>
+          {% for f in recent_files %}
+          <li><a href="{{ url_for('download', filename=f) }}">{{ f }}</a></li>
+          {% else %}
+          <li>아직 생성된 파일이 없습니다.</li>
+          {% endfor %}
+        </ul>
+      </section>
+    </main>
+    <script>
+      (() => {
+        const form = document.getElementById("crawlForm");
+        if (!form) return;
+
+        const runBtn = document.getElementById("runBtn");
+        const stopBtn = document.getElementById("stopBtn");
+        const csrfTokenInput = form.querySelector("input[name='csrf_token']");
+        const csrfToken = csrfTokenInput ? String(csrfTokenInput.value || "") : "";
+        const sourceSelect = form.querySelector("select[name='source']");
+        const localOnlyFields = Array.from(form.querySelectorAll(".source-local"));
+        const centralOnlyFields = Array.from(form.querySelectorAll(".source-central"));
+        const localYearInput = form.querySelector("input[name='year']");
+        const fiscalYearSelect = form.querySelector("select[name='fiscal_year']");
+        const regionInput = form.querySelector("select[name='region']");
+        const statusTitle = document.getElementById("liveStatusTitle");
+        const statusMessage = document.getElementById("liveStatusMessage");
+        const progressBar = document.getElementById("liveProgressBar");
+        const progressWrap = document.querySelector(".progress-wrap");
+        const progressMeta = document.getElementById("liveProgressMeta");
+        const resultText = document.getElementById("liveResult");
+        const downloadLink = document.getElementById("liveDownload");
+        const xlsxDownloadLink = document.getElementById("liveXlsxDownload");
+        const jsonDownloadLink = document.getElementById("liveJsonDownload");
+        const manifestDownloadLink = document.getElementById("liveManifestDownload");
+        const errorText = document.getElementById("liveError");
+        const terminalStatuses = new Set(["completed", "failed", "stopped"]);
+        const runningStatuses = new Set(["queued", "running", "stopping"]);
+
+        let activeJobId = null;
+        let pollTimer = null;
+
+        function syncSourceOptions() {
+          if (!sourceSelect) return;
+          const isCentral = sourceSelect.value === "central";
+          localOnlyFields.forEach((el) => {
+            el.style.display = isCentral ? "none" : "";
+          });
+          centralOnlyFields.forEach((el) => {
+            el.style.display = isCentral ? "" : "none";
+          });
+          if (localYearInput) localYearInput.disabled = isCentral;
+          if (regionInput) {
+            regionInput.disabled = isCentral;
+            if (isCentral) regionInput.selectedIndex = 0;
+          }
+          if (fiscalYearSelect) fiscalYearSelect.disabled = !isCentral;
+        }
+
+        function clampPercent(value) {
+          const n = Number(value || 0);
+          if (!Number.isFinite(n)) return 0;
+          return Math.max(0, Math.min(100, Math.floor(n)));
+        }
+
+        function setButtons(isRunning) {
+          runBtn.disabled = isRunning;
+          stopBtn.disabled = !isRunning;
+        }
+
+        function hideRuntimeMessages() {
+          resultText.hidden = true;
+          resultText.textContent = "";
+          downloadLink.hidden = true;
+          downloadLink.removeAttribute("href");
+          downloadLink.textContent = "";
+          xlsxDownloadLink.hidden = true;
+          xlsxDownloadLink.removeAttribute("href");
+          xlsxDownloadLink.textContent = "";
+          jsonDownloadLink.hidden = true;
+          jsonDownloadLink.removeAttribute("href");
+          jsonDownloadLink.textContent = "";
+          manifestDownloadLink.hidden = true;
+          manifestDownloadLink.removeAttribute("href");
+          manifestDownloadLink.textContent = "";
+          errorText.hidden = true;
+          errorText.textContent = "";
+        }
+
+        function titleForStatus(status) {
+          if (status === "queued") return "대기";
+          if (status === "running") return "실행 중";
+          if (status === "stopping") return "중지 요청됨";
+          if (status === "completed") return "완료";
+          if (status === "stopped") return "중지됨";
+          if (status === "failed") return "오류";
+          return "대기";
+        }
+
+        function renderJob(job) {
+          if (!job) {
+            statusTitle.textContent = "대기";
+            statusMessage.textContent = "작업 대기 중입니다.";
+            progressBar.style.width = "0%";
+            progressWrap.setAttribute("aria-valuenow", "0");
+            progressMeta.textContent = "0%";
+            hideRuntimeMessages();
+            setButtons(false);
+            return;
+          }
+
+          const status = String(job.status || "");
+          const progress = job.progress || {};
+          const percent = clampPercent(progress.percent);
+          const current = Number(progress.current || 0);
+          const total = Number(progress.total || 0);
+
+          statusTitle.textContent = titleForStatus(status);
+          statusMessage.textContent = String(job.message || "");
+          progressBar.style.width = `${percent}%`;
+          progressBar.classList.remove("completed", "failed");
+          if (status === "completed") progressBar.classList.add("completed");
+          if (status === "failed") progressBar.classList.add("failed");
+          progressWrap.setAttribute("aria-valuenow", String(percent));
+          progressMeta.textContent = total > 0 ? `${current} / ${total} (${percent}%)` : `${percent}%`;
+
+          hideRuntimeMessages();
+          if (status === "failed") {
+            errorText.hidden = false;
+            errorText.textContent = String(job.error || "실행 중 오류가 발생했습니다.");
+          }
+          if (status === "completed" && job.result) {
+            const file = String(job.result.file || "");
+            const xlsxFile = String(job.result.xlsx_file || "");
+            const jsonFile = String(job.result.json_file || "");
+            const manifestFile = String(job.result.manifest_file || "");
+            const chunks = Number(job.result.chunks || 0);
+            const count = Number(job.result.count || 0);
+            if (file) {
+              resultText.hidden = false;
+              resultText.textContent = chunks > 0 ? `${count}건 저장됨 / 파트 ${chunks}개` : (jsonFile ? `${count}건 저장됨 / 검색 색인 ${jsonFile}` : `${count}건 저장됨`);
+              downloadLink.hidden = false;
+              downloadLink.href = `/download/${encodeURIComponent(file)}`;
+              downloadLink.textContent = `${file} 다운로드`;
+              if (xlsxFile && xlsxFile !== file) {
+                xlsxDownloadLink.hidden = false;
+                xlsxDownloadLink.href = `/download/${encodeURIComponent(xlsxFile)}`;
+                xlsxDownloadLink.textContent = `${xlsxFile} 다운로드`;
+              }
+              if (jsonFile) {
+                jsonDownloadLink.hidden = false;
+                jsonDownloadLink.href = `/download/${encodeURIComponent(jsonFile)}`;
+                jsonDownloadLink.textContent = `${jsonFile} 다운로드`;
+              }
+              if (manifestFile) {
+                manifestDownloadLink.hidden = false;
+                manifestDownloadLink.href = `/download/${encodeURIComponent(manifestFile)}`;
+                manifestDownloadLink.textContent = `${manifestFile} 다운로드`;
+              }
+            }
+          }
+
+          setButtons(runningStatuses.has(status));
+        }
+
+        function stopPolling() {
+          if (pollTimer !== null) {
+            clearInterval(pollTimer);
+            pollTimer = null;
+          }
+        }
+
+        async function pollStatus() {
+          if (!activeJobId) return;
+          try {
+            const response = await fetch(`/api/jobs/${encodeURIComponent(activeJobId)}`, { cache: "no-store" });
+            const payload = await response.json();
+            if (!response.ok) {
+              throw new Error(String(payload.error || "상태 조회에 실패했습니다."));
+            }
+            const job = payload.job || null;
+            renderJob(job);
+            if (!job || terminalStatuses.has(String(job.status || ""))) {
+              stopPolling();
+            }
+          } catch (err) {
+            stopPolling();
+            setButtons(false);
+            errorText.hidden = false;
+            errorText.textContent = String(err?.message || "상태 조회에 실패했습니다.");
+          }
+        }
+
+        function startPolling() {
+          stopPolling();
+          pollTimer = setInterval(pollStatus, 1000);
+        }
+
+        if (sourceSelect) {
+          sourceSelect.addEventListener("change", syncSourceOptions);
+        }
+        syncSourceOptions();
+
+        form.addEventListener("submit", async (event) => {
+          event.preventDefault();
+
+          const MAX_LIMIT = 500000;
+          const limitVal = Number(form.querySelector("input[name='limit']").value || 0);
+          const chunkVal = Number(form.querySelector("input[name='chunk_size']").value || 0);
+          if (limitVal > MAX_LIMIT) {
+            alert(`갯수는 최대 ${MAX_LIMIT.toLocaleString()}건까지 가능합니다.`);
+            return;
+          }
+          const MAX_CHUNK = 10000;
+          if (chunkVal > MAX_CHUNK) {
+            alert(`청크 크기는 최대 ${MAX_CHUNK.toLocaleString()}까지 가능합니다.`);
+            return;
+          }
+
+          hideRuntimeMessages();
+          statusTitle.textContent = "요청 중";
+          statusMessage.textContent = "작업 시작을 요청합니다.";
+          setButtons(true);
+
+          try {
+            const response = await fetch("/api/run", {
+              method: "POST",
+              headers: csrfToken ? { "X-CSRF-Token": csrfToken } : {},
+              body: new URLSearchParams(new FormData(form)),
+            });
+            const payload = await response.json();
+            if (!response.ok) {
+              throw new Error(String(payload.error || "실행 요청에 실패했습니다."));
+            }
+            const job = payload.job || null;
+            if (!job || !job.id) {
+              throw new Error("작업 정보가 비어 있습니다.");
+            }
+            activeJobId = String(job.id);
+            renderJob(job);
+            startPolling();
+            pollStatus();
+          } catch (err) {
+            setButtons(false);
+            errorText.hidden = false;
+            errorText.textContent = String(err?.message || "실행 요청에 실패했습니다.");
+          }
+        });
+
+        stopBtn.addEventListener("click", async () => {
+          if (!activeJobId) return;
+          try {
+            const response = await fetch(`/api/jobs/${encodeURIComponent(activeJobId)}/stop`, {
+              method: "POST",
+              headers: csrfToken ? { "X-CSRF-Token": csrfToken } : {},
+            });
+            const payload = await response.json();
+            if (!response.ok && !payload.job) {
+              throw new Error(String(payload.error || "중지 요청에 실패했습니다."));
+            }
+            renderJob(payload.job || null);
+            pollStatus();
+          } catch (err) {
+            errorText.hidden = false;
+            errorText.textContent = String(err?.message || "중지 요청에 실패했습니다.");
+          }
+        });
+
+        (async () => {
+          try {
+            const response = await fetch("/api/jobs/active", { cache: "no-store" });
+            const payload = await response.json();
+            const job = payload.job || null;
+            if (!job) {
+              renderJob(null);
+              return;
+            }
+            activeJobId = String(job.id || "");
+            renderJob(job);
+            if (runningStatuses.has(String(job.status || ""))) {
+              startPolling();
+              pollStatus();
+            }
+          } catch (err) {
+            renderJob(null);
+          }
+        })();
+      })();
+    </script>
+  </body>
+</html>
