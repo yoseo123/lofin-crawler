@@ -5,6 +5,7 @@ from datetime import datetime
 import hashlib
 import json
 import re
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -114,9 +115,50 @@ def _policy_year(row: dict[str, str], default_year: str | int | None) -> int | N
     return _parse_year(row.get("회계연도")) or _parse_year(default_year)
 
 
-def _policy_id(source: str, title: str, region: str, municipality: str, year: int | None) -> str:
+CENTRAL_ID_FIELDS = ("소관명", "회계명", "프로그램명", "단위사업명", "세부사업명")
+
+
+def _identity_text(value: Any) -> str:
+    return " ".join(unicodedata.normalize("NFC", _text(value)).split())
+
+
+def _central_identity(
+    row: dict[str, str], title: str, region: str, municipality: str, year: int | None,
+) -> tuple[str, str]:
+    # The collector currently exports names, not authoritative business codes.
+    hierarchy = [_identity_text(row.get(field)) for field in CENTRAL_ID_FIELDS]
+    hierarchy[-1] = hierarchy[-1] or _identity_text(title)
+    complete = all(hierarchy)
+    identity: list[Any] = [
+        "central", 2, year, _identity_text(region), _identity_text(municipality), hierarchy,
+    ]
+    if not complete:
+        # Missing hierarchy must not turn a broad title into a deduplication key.
+        # Retain all available evidence except the collection-order row number.
+        identity.append({
+            str(key): _identity_text(value)
+            for key, value in row.items()
+            if key not in {"번호", "회계연도", "지역", "자치단체", "사업명", *CENTRAL_ID_FIELDS}
+            and _identity_text(value)
+        })
+    return json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")), (
+        "hierarchy" if complete else "row_fallback"
+    )
+
+
+def _legacy_policy_id(source: str, title: str, region: str, municipality: str, year: int | None) -> str:
     raw = "|".join([source, title, region, municipality, str(year or "")])
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _policy_id(
+    source: str, title: str, region: str, municipality: str, year: int | None,
+    *, row: dict[str, str] | None = None,
+) -> str:
+    if source == "central":
+        identity, _ = _central_identity(row or {}, title, region, municipality, year)
+        return "central-v2-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return _legacy_policy_id(source, title, region, municipality, year)
 
 
 def normalize_policy_row(
@@ -139,7 +181,13 @@ def normalize_policy_row(
     budget_amount = _parse_int(row.get("총사업비")) or _parse_int(row.get("예산액"))
 
     return {
-        "id": _policy_id(source_name, title, region, municipality, year),
+        "id": _policy_id(source_name, title, region, municipality, year, row=row),
+        "id_version": 2 if source_name == "central" else 1,
+        "legacy_id": _legacy_policy_id(source_name, title, region, municipality, year),
+        "identity_quality": (
+            _central_identity(row, title, region, municipality, year)[1]
+            if source_name == "central" else "legacy"
+        ),
         "source": source_name,
         "source_label": source_label,
         "title": title,
@@ -181,6 +229,12 @@ def build_policy_index(
             skipped += 1
             continue
         key = str(policy["id"])
+        if policy["source"] == "central":
+            # Compare the canonical identity, not a shortened hash or legacy ID.
+            key, _ = _central_identity(
+                row, str(policy["title"]), str(policy["region"]),
+                str(policy["municipality"]), policy["year"],
+            )
         if key in seen:
             skipped += 1
             continue
