@@ -23,6 +23,9 @@ TEXT_FIELDS: tuple[str, ...] = (
     "회계연도",
     "조직",
     "소관명",
+    "회계명",
+    "프로그램명",
+    "단위사업명",
     "사업목적",
     "사업내용",
     "사업내용(가능 시)",
@@ -135,6 +138,9 @@ def policy_payload(policy: dict[str, Any], *, embedding_text: str, source_file: 
     raw = policy.get("raw") if isinstance(policy.get("raw"), dict) else {}
     return {
         "policy_id": str(policy.get("id") or ""),
+        "id_version": policy.get("id_version", 1),
+        "legacy_id": str(policy.get("legacy_id") or policy.get("id") or ""),
+        "identity_quality": str(policy.get("identity_quality") or "legacy"),
         "title": str(policy.get("title") or ""),
         "year": policy.get("year"),
         "region": str(policy.get("region") or ""),

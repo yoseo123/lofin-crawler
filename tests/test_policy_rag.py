@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from src.policy_index import export_policy_index
 
 from src.policy_rag import (
     build_embedding_batch_jsonl,
@@ -18,6 +19,41 @@ from src.policy_rag import (
 
 
 class PolicyRagTests(unittest.TestCase):
+    def test_central_export_load_batch_and_payload_preserve_distinct_businesses(self):
+        base = {
+            "회계연도": "2026", "소관명": "가상부처 A", "회계명": "일반회계",
+            "프로그램명": "프로그램", "단위사업명": "단위사업", "세부사업명": "같은사업",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            first, second = [Path(temp_dir) / name for name in ("a.json", "b.json")]
+            export_policy_index([base], first, source="central")
+            export_policy_index([base, {**base, "소관명": "가상부처 B"}], second, source="central")
+            policies, skipped = load_policies_from_files([first, second])
+            self.assertEqual((len(policies), skipped), (2, 1))
+            self.assertEqual(policies[0]["legacy_id"], policies[1]["legacy_id"])
+            output = Path(temp_dir) / "batch.jsonl"
+            result = build_embedding_batch_jsonl(policies, output, model="fake", dimensions=2)
+            requests = [json.loads(line) for line in output.read_text().splitlines()]
+            self.assertEqual(result.requests, 2)
+            ids = {p["id"] for p in policies}
+            self.assertEqual({r["custom_id"].split(":", 1)[0] for r in requests}, ids)
+            responses = Path(temp_dir) / "responses.jsonl"
+            responses.write_text("\n".join(json.dumps({
+                "custom_id": r["custom_id"],
+                "response": {"body": {"data": [{"embedding": [0.1, 0.2]}]}},
+            }) for r in requests), encoding="utf-8")
+            self.assertEqual(set(parse_embedding_batch_result(responses)), ids)
+        self.assertEqual(len({qdrant_point_id(p["id"]) for p in policies}), 2)
+        for p in policies:
+            text = build_policy_embedding_text(p)
+            self.assertIn("회계명: 일반회계", text)
+            self.assertIn("프로그램명: 프로그램", text)
+            self.assertIn("단위사업명: 단위사업", text)
+            payload = policy_payload(p, embedding_text=text)
+            self.assertEqual(payload["id_version"], 2)
+            self.assertEqual(payload["legacy_id"], p["legacy_id"])
+            self.assertEqual(payload["identity_quality"], "hierarchy")
+
     def sample_policy(self):
         return {
             "id": "p1",

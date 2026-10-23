@@ -1,5 +1,8 @@
 # Lofin365 정책 크롤러 (정책 수집 -> 상세 추출 -> Markdown/XLSX + 검색 색인 저장)
 
+중앙정부 정책 ID v2의 식별 기준·기존 ID 호환성·수동 재색인 절차는
+[정책 ID 전환 안내](docs/policy-id-v2.md)를 참고하세요. 지방정부 ID는 유지합니다.
+
 ## 1) 설치
 ```bash
 cd lofin-crawler
