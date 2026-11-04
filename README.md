@@ -144,3 +144,10 @@ python build_policy_rag_index.py upsert-batch \
 - Qdrant 기본 collection: `policy_cases_v1`
 - OpenAI embedding 기본 모델: `text-embedding-3-large`, `dimensions=1536`
 - 웹 API: `POST /api/similar-policies` (`query`, `top_k`, `year_from`, `year_to`, `region`, `municipality`, `category`). 웹앱의 CSRF 보호가 적용되므로 브라우저/API 클라이언트에서는 기존 CSRF 토큰을 `X-CSRF-Token` 헤더로 함께 전송합니다.
+
+## 대량 수집 중단 복구
+
+청크 저장에서는 건별 SQLite 기록과 원자적으로 교체하는 출력/manifest를 사용합니다.
+중단 후 같은 조건과 시작할 때 표시된 실제 출력 경로로 `--resume`을 지정하세요.
+구버전 결과는 자동 재개하지 않습니다. [재개 절차와 복구 범위](docs/crawl-resume.md)를 참고하세요.
+외부 호출 없이 회귀 테스트를 실행하려면 `python3 tests/run_offline.py`를 사용합니다.
