@@ -33,6 +33,7 @@ from src.central_hwpx import (
     extract_hwpx_text,
 )
 from src.chunked_writer import ChunkedPolicyWriter
+from src.resume_state import central_entry_key, local_entry_key
 from src.detail_fallback import should_open_detail_page
 from src.detail_popup_api import build_popup_detail_form
 from src.env_loader import load_env_file
@@ -1476,6 +1477,7 @@ def _crawl_central_source(
     progress_callback: Callable[[dict[str, object]], None] | None,
     stop_requested: Callable[[], bool] | None,
     row_callback: Callable[[dict[str, str]], None] | None = None,
+    checkpoint: ChunkedPolicyWriter | None = None,
 ) -> list[dict[str, str]]:
     safe_limit = max(1, int(limit))
     central_year = validate_central_year(year or "")
@@ -1532,6 +1534,8 @@ def _crawl_central_source(
                 ).lower()
             ]
 
+        if checkpoint is not None:
+            checkpoint.bind_conditions({"source": "central", "year": central_year, "keyword": keyword})
         limited_raw_rows = raw_rows[:safe_limit]
         if limited_raw_rows:
             sample = limited_raw_rows[0]
@@ -1545,6 +1549,9 @@ def _crawl_central_source(
         if total_rows:
             for row_no, (mapped_row, raw_row) in enumerate(zip(rows, limited_raw_rows), start=1):
                 _raise_if_stopped(stop_requested)
+                entry_key = central_entry_key(raw_row)
+                if checkpoint is not None and (checkpoint.at_limit or checkpoint.contains(entry_key)):
+                    continue
                 _notify_progress(
                     f"세부사업 상세정보를 수집합니다. ({row_no}/{total_rows})",
                     65 + int((row_no / max(total_rows, 1)) * 30),
@@ -1562,7 +1569,9 @@ def _crawl_central_source(
                 for field_name, field_value in detail_fields.items():
                     if field_value:
                         mapped_row[field_name] = field_value
-                if row_callback is not None:
+                if checkpoint is not None:
+                    checkpoint.add_row(dict(mapped_row), key=entry_key)
+                elif row_callback is not None:
                     row_callback(dict(mapped_row))
         context.close()
         browser.close()
@@ -1588,7 +1597,10 @@ def crawl(
     progress_callback: Callable[[dict[str, object]], None] | None = None,
     stop_requested: Callable[[], bool] | None = None,
     row_callback: Callable[[dict[str, str]], None] | None = None,
+    checkpoint: ChunkedPolicyWriter | None = None,
 ) -> list[dict[str, str]]:
+    if checkpoint is not None and row_callback is None:
+        row_callback = checkpoint.add_row
     rows: list[dict[str, str]] = []
     source_name = normalize_source(source)
     safe_detail_request_timeout_ms = max(1_000, min(int(detail_request_timeout_ms), 60_000))
@@ -1622,6 +1634,7 @@ def crawl(
             progress_callback=progress_callback,
             stop_requested=stop_requested,
             row_callback=row_callback,
+            checkpoint=checkpoint,
         )
 
     _notify_progress("브라우저를 시작합니다.", 2)
@@ -1638,9 +1651,13 @@ def crawl(
         _notify_progress("검색 조건을 준비합니다.", 12)
 
         if year:
-            _set_filter_value(page, YEAR_FILTER_SELECTORS, year, "연도/날짜")
+            applied = _set_filter_value(page, YEAR_FILTER_SELECTORS, year, "연도/날짜")
+            if checkpoint is not None and not applied:
+                raise ValueError("요청한 연도 필터를 적용하지 못했습니다.")
         if region:
-            _set_filter_value(page, REGION_FILTER_SELECTORS, region, "지역")
+            applied = _set_filter_value(page, REGION_FILTER_SELECTORS, region, "지역")
+            if checkpoint is not None and not applied:
+                raise ValueError("요청한 지역 필터를 적용하지 못했습니다.")
 
         search_input = _first_visible(page, SEARCH_INPUT_SELECTORS)
         if search_input is None:
@@ -1693,6 +1710,15 @@ def crawl(
             saw_entries = False
             _notify_progress(f"상세 정보를 병렬 수집합니다. (0/{total_rows})", 30, 0, total_rows)
             base_form = list_request_forms[-1] if list_request_forms else {}
+            if checkpoint is not None:
+                if base_form:
+                    checkpoint.bind_conditions({"mode": "http", "form": {
+                        k: v for k, v in base_form.items() if k not in {"curPage", "pageIndex", "pageSize"}
+                    }})
+                else:
+                    if not year:
+                        raise ValueError("실제 검색 연도를 확인할 수 없습니다. --year를 명시하세요.")
+                    checkpoint.bind_conditions({"mode": "dom", "year": year, "region": region, "keyword": keyword})
             if base_form:
                 page_batches = _iter_policy_entry_batches_via_http(
                     base_form=base_form,
@@ -1714,6 +1740,9 @@ def crawl(
             ):
                 saw_entries = True
                 _raise_if_stopped(stop_requested)
+                if checkpoint is not None:
+                    entry_batch = [entry for entry in entry_batch
+                                   if not checkpoint.at_limit and not checkpoint.contains(local_entry_key(entry))]
                 batch_rows = _collect_detail_rows_via_http_parallel(
                     entry_batch,
                     start_row_no=row_no,
@@ -1722,8 +1751,11 @@ def crawl(
                     concurrency=safe_detail_concurrency,
                     stop_requested=stop_requested,
                 )
-                for data in batch_rows:
-                    row_callback(data)
+                for entry, data in zip(entry_batch, batch_rows):
+                    if checkpoint is not None:
+                        checkpoint.add_row(data, key=local_entry_key(entry))
+                    else:
+                        row_callback(data)
                     row_no += 1
                     if safe_detail_delay_sec > 0:
                         time.sleep(safe_detail_delay_sec)
@@ -1877,7 +1909,9 @@ def crawl(
                 "자치단체": "",
                 **selected,
             }
-            if row_callback is not None:
+            if checkpoint is not None:
+                checkpoint.add_row(data)
+            elif row_callback is not None:
                 row_callback(data)
             else:
                 rows.append(data)
@@ -1959,6 +1993,7 @@ def main(argv: list[str]) -> int:
         default="auto",
         help="결과 파일 형식. auto는 --output 확장자를 따름",
     )
+    parser.add_argument("--resume", action="store_true", help="--output의 기존 타임스탬프 경로에서 동일 조건으로 재개 (청크 저장 전용)")
     parser.add_argument("--json-output", default="", help="검색 앱용 JSON 색인 출력 경로. 비우면 결과 파일과 같은 이름으로 저장")
     parser.add_argument("--headed", action="store_true", help="브라우저 창을 띄워서 실행")
     parser.add_argument("--slow-mo", type=int, default=0, help="동작 사이 지연(ms)")
@@ -1998,10 +2033,16 @@ def main(argv: list[str]) -> int:
     args.limit = _clamp_cli_limit(args.limit)
     chunk_size = max(0, min(int(args.chunk_size), MAX_CRAWL_LIMIT))
     output_format = _infer_output_format(args.output, args.format)
-    output_path = with_timestamp_suffix(_normalize_cli_output_path(args.output, output_format))
+    output_path = _normalize_cli_output_path(args.output, output_format)
+    if not args.resume:
+        output_path = with_timestamp_suffix(output_path)
+    elif not _chunked_output_enabled(args.limit, chunk_size):
+        parser.error("--resume은 --limit > --chunk-size > 0인 청크 저장에서만 사용할 수 있습니다.")
     region_filter = normalize_region_filter(args.region)
 
     if _chunked_output_enabled(args.limit, chunk_size):
+        if args.source == CENTRAL_SOURCE:
+            args.year = validate_central_year(args.year)
         writer = ChunkedPolicyWriter(
             output_path=output_path,
             output_format=output_format,
@@ -2010,7 +2051,14 @@ def main(argv: list[str]) -> int:
             source_url=URL if args.source == LOCAL_SOURCE else CENTRAL_LIST_URL,
             default_year=args.year or "",
             default_region=region_filter,
+            search_conditions={
+                "keyword": args.keyword, "limit": args.limit,
+                "detail_request_timeout_ms": args.detail_request_timeout_ms,
+                "detail_runtime_timeout_ms": args.detail_runtime_timeout_ms,
+            },
+            resume=args.resume,
         )
+        print(f"수집 출력 경로 (재개 시 --resume --output에 지정): {output_path}")
         try:
             crawl(
                 keyword=args.keyword,
@@ -2027,9 +2075,13 @@ def main(argv: list[str]) -> int:
                 detail_concurrency=args.detail_concurrency,
                 detail_batch_size=args.detail_batch_size,
                 row_callback=writer.add_row,
+                checkpoint=writer,
             )
-        except Exception:
-            writer.close(complete=False)
+        except BaseException:
+            try:
+                writer.close(complete=False)
+            except Exception as close_error:
+                print(f"출력 저장 실패. 건별 기록에서 --resume으로 복구하세요: {close_error}", file=sys.stderr)
             raise
 
         result = writer.close(complete=True)
