@@ -38,9 +38,11 @@ from src.web_helpers import (
 load_env_file()
 
 BASE_DIR = Path(__file__).resolve().parent
+OUTPUT_DIR = BASE_DIR / "outputs"
 
 app = Flask(__name__)
 app.config["TEMPLATES_AUTO_RELOAD"] = True
+app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024
 
 _TRUE_VALUES = {"1", "true", "yes", "on", "y"}
 _secret_key = (os.getenv("LOFIN_WEB_SECRET_KEY") or "").strip()
@@ -144,9 +146,6 @@ def _csrf_token_is_valid() -> bool:
 
 
 def _client_key() -> str:
-    forwarded = str(request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
-    if forwarded:
-        return forwarded
     remote = str(request.remote_addr or "").strip()
     if remote:
         return remote
@@ -213,6 +212,34 @@ def _render_index(
 
 
 @app.before_request
+def enforce_local_access():
+    remote_enabled = (os.getenv("LOFIN_ALLOW_REMOTE") or "").strip().lower() in _TRUE_VALUES
+    password = os.getenv("LOFIN_WEB_PASSWORD") or ""
+    # Authenticate even loopback peers in remote mode: a reverse proxy often
+    # connects from localhost. Forwarded headers must never grant access.
+    if remote_enabled or password:
+        if len(password) < 32:
+            abort(503, description="LOFIN_WEB_PASSWORD must contain at least 32 characters.")
+        auth = request.authorization
+        if (auth is None or auth.type != "basic"
+                or not hmac.compare_digest((auth.username or "").encode(), b"lofin")
+                or not hmac.compare_digest((auth.password or "").encode(), password.encode())):
+            return ("Authentication required", 401,
+                    {"WWW-Authenticate": 'Basic realm="Lofin", charset="UTF-8"'})
+    if not remote_enabled:
+        if not _is_loopback_address(str(request.remote_addr or "")):
+            abort(403)
+        # Prevent DNS rebinding against an unauthenticated local instance.
+        hostname = urlparse(request.host_url).hostname or ""
+        if hostname.lower() != "localhost" and not _is_loopback_address(hostname):
+            abort(403)
+        # Local reverse proxies must use authenticated remote mode.
+        if any(name in request.headers for name in
+               ("Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Real-IP")):
+            abort(403)
+
+
+@app.before_request
 def enforce_request_protection() -> None:
     if request.method not in {"POST", "PUT", "PATCH", "DELETE"}:
         return
@@ -224,23 +251,41 @@ def enforce_request_protection() -> None:
         abort(403)
 
 
-@app.before_request
-def enforce_local_access() -> None:
-    if _is_loopback_address(str(request.remote_addr or "")):
-        return
-    if (os.getenv("LOFIN_ALLOW_REMOTE") or "").strip().lower() in _TRUE_VALUES:
-        return
-    abort(403)
+@app.after_request
+def protect_response(response):
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "same-origin"
+    return response
+
+
+def _downloadable_path(filename: str) -> Path | None:
+    if not is_allowed_download_filename(filename):
+        return None
+    path = OUTPUT_DIR / filename
+    # Never serve recovery stores, temporary files, source files or symlinks.
+    if OUTPUT_DIR.is_symlink() or path.is_symlink() or not path.is_file():
+        return None
+    if path.resolve().parent != OUTPUT_DIR.resolve():
+        return None
+    return path
 
 
 def _recent_outputs(limit: int = 10) -> list[str]:
     files = [
         path
-        for pattern in ("*.md", "*.xlsx", "*.json")
-        for path in BASE_DIR.glob(pattern)
+        for path in OUTPUT_DIR.glob("*")
+        if _downloadable_path(path.name) is not None
     ]
     files = sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
     return [f.name for f in files[:limit]]
+
+
+def _web_output_path(params: dict[str, object]) -> Path:
+    if OUTPUT_DIR.is_symlink():
+        raise ValueError("출력 폴더에는 심볼릭 링크를 사용할 수 없습니다.")
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    return with_timestamp_suffix(OUTPUT_DIR / str(params["output"]))
 
 
 def _default_form_defaults() -> dict[str, object]:
@@ -326,7 +371,7 @@ def _similar_policy_request_payload(payload: dict[str, Any]) -> tuple[str, int, 
 
 def _write_output_files(rows: list[dict[str, str]], params: dict[str, object]) -> dict[str, object]:
     output_format = str(params.get("output_format", "md") or "md")
-    output_path = with_timestamp_suffix(BASE_DIR / str(params["output"]))
+    output_path = _web_output_path(params)
     md_path = output_path.with_suffix(".md") if output_format in {"md", "both"} else None
     xlsx_path = output_path.with_suffix(".xlsx") if output_format in {"xlsx", "both"} else None
 
@@ -369,7 +414,7 @@ def _chunked_output_enabled(params: dict[str, object]) -> bool:
 
 def _create_chunked_writer(params: dict[str, object]) -> ChunkedPolicyWriter:
     output_format = str(params.get("output_format", "md") or "md")
-    output_path = with_timestamp_suffix(BASE_DIR / str(params["output"]))
+    output_path = _web_output_path(params)
     return ChunkedPolicyWriter(
         output_path=output_path,
         output_format=output_format,
@@ -563,63 +608,8 @@ def index_get():
 
 @app.post("/")
 def index_post():
-    form_data = _request_form_data()
-
-    try:
-        params = build_run_params(form_data)
-        writer = _create_chunked_writer(params) if _chunked_output_enabled(params) else None
-        try:
-            rows = crawl(
-                keyword=params["keyword"],
-                limit=params["limit"],
-                headless=not params["headed"],
-                slow_mo_ms=0,
-                source=str(params.get("source", LOCAL_SOURCE)),
-                year=params["year"] or None,
-                region=params["region"] or None,
-                debug_dir=BASE_DIR / "debug",
-                row_callback=writer.add_row if writer is not None else None,
-            )
-        except Exception:
-            if writer is not None:
-                writer.close(complete=False)
-            raise
-
-        if writer is not None:
-            chunked_result = writer.close(complete=True)
-            if chunked_result.count == 0:
-                return _render_index(
-                    result=None,
-                    error="수집 결과가 없습니다. 조건을 바꿔 다시 시도하세요.",
-                    form_defaults=form_data,
-                )
-            output_result = _chunked_result_payload(chunked_result)
-            count = int(chunked_result.count)
-        elif not rows:
-            return _render_index(
-                result=None,
-                error="수집 결과가 없습니다. 조건을 바꿔 다시 시도하세요.",
-                form_defaults=form_data,
-            )
-        else:
-            output_result = _write_output_files(rows, params)
-            count = len(rows)
-
-        return _render_index(
-            result={
-                "count": count,
-                **output_result,
-            },
-            error=None,
-            form_defaults=form_data,
-        )
-
-    except Exception as exc:
-        return _render_index(
-            result=None,
-            error=user_facing_error_message(exc),
-            form_defaults=form_data,
-        )
+    # The legacy form must share admission limits with the JavaScript API.
+    return api_run()
 
 
 @app.post("/api/run")
@@ -743,13 +733,19 @@ def api_similar_policies():
 def download(filename: str):
     if not is_allowed_download_filename(filename):
         abort(400)
-    if not (BASE_DIR / filename).is_file():
+    if _downloadable_path(filename) is None:
         abort(404)
-    return send_from_directory(BASE_DIR, filename, as_attachment=True)
+    return send_from_directory(OUTPUT_DIR, filename, as_attachment=True)
 
 
 if __name__ == "__main__":
     port = int(os.getenv("LOFIN_WEB_PORT", "8787"))
-    host = os.getenv("LOFIN_WEB_HOST", "0.0.0.0")
+    host = os.getenv("LOFIN_WEB_HOST", "127.0.0.1")
+    remote_enabled = (os.getenv("LOFIN_ALLOW_REMOTE") or "").strip().lower() in _TRUE_VALUES
+    if remote_enabled and len(os.getenv("LOFIN_WEB_PASSWORD") or "") < 32:
+        raise SystemExit("Remote mode requires LOFIN_WEB_PASSWORD (at least 32 characters).")
+    if host != "localhost" and not _is_loopback_address(host) and not remote_enabled:
+        raise SystemExit("Non-loopback binding requires authenticated LOFIN_ALLOW_REMOTE=true.")
     print(f"[INFO] Web UI: http://{host}:{port}")
     app.run(host=host, port=port, debug=False)
+

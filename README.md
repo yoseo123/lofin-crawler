@@ -91,9 +91,24 @@ python webapp.py
 - 폼에서 `검색어/출처/날짜(또는 회계년)/지역/갯수/청크 크기/파일 형식` 입력 후 실행
 - 검색어를 비우면 선택한 조건 기준으로 전체 조회를 시도합니다.
 - `출처=중앙정부` 선택 시 `회계년(2018~2026)`만 표시되고 `지역` 입력은 숨김 처리됩니다.
-- 결과 파일은 프로젝트 폴더에 `*_YYYYMMDD_HHMMSS.md`와 `*_YYYYMMDD_HHMMSS.json`으로 생성
+- 웹 결과 파일은 프로젝트의 전용 `outputs/` 폴더에 `*_YYYYMMDD_HHMMSS.md`와 `*_YYYYMMDD_HHMMSS.json`으로 생성
 - `파일 형식=Markdown + XLSX`를 고르면 `.md`, `.xlsx`, `.json`을 함께 생성
 - 대량 수집 시 `*_part001.md`, `*_part001.json`, `*_manifest.json` 형식으로 나뉘어 생성
+
+### 웹 접근과 결과 파일 보안
+
+- 기본 바인딩은 `127.0.0.1`이며 같은 컴퓨터에서만 사용합니다. 기본 로컬 모드는 외부 IP, 임의 Host 및 전달 헤더를 거부합니다. CSRF 검증은 로그인과 별개로 유지됩니다.
+- 원격 접속이 필요하면 `LOFIN_ALLOW_REMOTE=true`, `LOFIN_WEB_HOST=0.0.0.0`, **32자 이상의 무작위 `LOFIN_WEB_PASSWORD`**를 설정합니다. 브라우저의 HTTP Basic 로그인 사용자명은 `lofin`입니다. 비밀번호가 없거나 짧으면 원격 모드는 동작하지 않습니다. 비밀번호는 URL·명령줄 인수·저장소에 넣지 말고 권한을 제한한 `.env` 또는 비밀 환경변수로 전달하세요.
+- 원격 모드에서는 localhost에서 오는 프록시 요청에도 인증을 요구합니다. `X-Forwarded-For`는 접근 허용이나 요청 제한의 사용자 구분에 사용하지 않습니다. 프록시 뒤에서는 같은 프록시를 통한 실행 요청 제한이 공유됩니다.
+- **외부에 Flask 개발 서버나 HTTP Basic을 평문 HTTP로 공개하지 마세요.** 신뢰할 수 있는 HTTPS 역방향 프록시 또는 VPN/SSH 터널 뒤에서만 사용하고, HTTPS에서는 `LOFIN_WEB_COOKIE_SECURE=true`와 `LOFIN_ALLOWED_ORIGINS=https://crawler.example.com`처럼 정확한 외부 origin을 설정하세요. 프록시는 Authorization 헤더를 전달해야 합니다. 이는 하나의 공유 비밀번호이며 사용자별 권한 분리 기능은 아닙니다.
+- Docker도 명시적인 원격 모드와 비밀번호가 필요합니다. 컨테이너에는 위 환경변수를 전달하되 호스트 포트는 `-p 127.0.0.1:8787:8787`로 제한하고, `/app/outputs`를 별도 볼륨으로 보존하세요. 외부 접근은 HTTPS 프록시에서만 허용하세요. `EXPOSE`만으로 포트가 게시되지는 않습니다.
+- 웹 다운로드와 최근 파일 목록은 `outputs/` 안의 일반 MD/XLSX/JSON 파일만 제공합니다. 소스 루트의 README, SQLite 원본 기록과 sidecar, JSONL, 숨김 임시 파일, 심볼릭 링크는 제공하지 않습니다. 웹 결과는 재시작 후에도 목록에 표시됩니다. 기존 루트 결과를 계속 내려받으려면 필요한 **내보내기 파일만** 관리자가 `outputs/`로 복사하세요. 복구용 SQLite는 웹 다운로드로 이동할 필요가 없습니다.
+- `outputs/`, JSONL, `*_resume.sqlite3`와 journal/WAL/SHM·잠금 파일, 숨김 atomic 임시 파일은 Git과 Docker 컨텍스트에서 제외합니다. 일반 `poetry.lock`, 코드, SQLite 테스트 fixture는 새 규칙으로 숨기지 않습니다. 기존에 추적된 파일이나 이전 커밋/이미지에 든 데이터는 ignore만으로 제거되지 않습니다. CLI로 임의 위치에 저장한 일반 데이터베이스는 자동 제외하지 않으므로 별도 데이터 폴더를 사용하세요.
+- PR #2의 중단 복구 기능과 독립적인 변경입니다. 두 변경을 함께 적용하면 웹 청크 출력과 SQLite 복구 기록이 모두 `outputs/`에 저장되며, CLI 경로와 재개 계약은 그대로입니다. 이 설정은 실제 배포/NAS를 변경하거나 공개 여부를 검사하지 않습니다.
+
+- 기존 `POST /`도 `POST /api/run`과 같은 단일 작업 큐와 실행 요청 제한을 사용합니다. JavaScript UI는 그대로이며, JavaScript 없이 폼을 제출하는 클라이언트는 동기 HTML 결과 대신 작업 ID가 포함된 JSON(202)을 받습니다. `GET /api/jobs/<id>`로 상태를 조회하세요.
+
+검증: `python -m unittest discover -s tests -v`. 실제 수집 사이트 호출 없이 테스트합니다.
 
 ### 3-1) Windows 더블클릭 실행
 - `start_webapp.bat` 더블클릭
@@ -144,3 +159,4 @@ python build_policy_rag_index.py upsert-batch \
 - Qdrant 기본 collection: `policy_cases_v1`
 - OpenAI embedding 기본 모델: `text-embedding-3-large`, `dimensions=1536`
 - 웹 API: `POST /api/similar-policies` (`query`, `top_k`, `year_from`, `year_to`, `region`, `municipality`, `category`). 웹앱의 CSRF 보호가 적용되므로 브라우저/API 클라이언트에서는 기존 CSRF 토큰을 `X-CSRF-Token` 헤더로 함께 전송합니다.
+

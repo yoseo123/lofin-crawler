@@ -16,3 +16,12 @@ __pycache__/
 *.zip
 *.log
 debug/
+
+
+# Generated crawl data and crash-recovery state (at any depth).
+**/outputs/
+**/*.jsonl
+**/*_resume.sqlite3
+**/*_resume.sqlite3-*
+**/*_resume.sqlite3.lock
+**/.*.tmp
