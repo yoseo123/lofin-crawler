@@ -20,6 +20,7 @@ from src.chunked_writer import ChunkedPolicyWriter
 from src.env_loader import load_env_file
 from src.exporter import export_to_excel, export_to_markdown
 from src.policy_index import export_policy_index
+from src.jev_reranker import JevReranker
 from src.policy_rag import (
     DEFAULT_COLLECTION,
     DEFAULT_EMBEDDING_DIMENSIONS,
@@ -304,9 +305,16 @@ def _similar_policy_service() -> SimilarPolicySearch:
     collection = (os.getenv("LOFIN_QDRANT_COLLECTION") or DEFAULT_COLLECTION).strip()
     model = (os.getenv("LOFIN_EMBEDDING_MODEL") or DEFAULT_EMBEDDING_MODEL).strip()
     dimensions = int(os.getenv("LOFIN_EMBEDDING_DIMENSIONS") or DEFAULT_EMBEDDING_DIMENSIONS)
+    reranker = None
+    if (os.getenv("LOFIN_JEV_API_KEY") or "").strip() or (os.getenv("BEATAPI_API_KEY") or "").strip():
+        try:
+            reranker = JevReranker()
+        except Exception:
+            app.logger.warning("Jev 초기화 실패: 기존 유사 정책 검색을 사용합니다.")
     _similar_search_service = SimilarPolicySearch(
         embedding_client=OpenAIEmbeddingClient(model=model, dimensions=dimensions),
         store=QdrantPolicyStore(url=qdrant_url, collection=collection, vector_size=dimensions),
+        reranker=reranker,
     )
     return _similar_search_service
 

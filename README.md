@@ -144,3 +144,43 @@ python build_policy_rag_index.py upsert-batch \
 - Qdrant 기본 collection: `policy_cases_v1`
 - OpenAI embedding 기본 모델: `text-embedding-3-large`, `dimensions=1536`
 - 웹 API: `POST /api/similar-policies` (`query`, `top_k`, `year_from`, `year_to`, `region`, `municipality`, `category`). 웹앱의 CSRF 보호가 적용되므로 브라우저/API 클라이언트에서는 기존 CSRF 토큰을 `X-CSRF-Token` 헤더로 함께 전송합니다.
+
+## 선택적 Jev 유사 정책 재정렬
+
+Qdrant 검색과 기존 임베딩은 유지하며, `LOFIN_JEV_API_KEY` 또는 `BEATAPI_API_KEY`를
+서버 환경에 설정하면 웹 검색에 Jev 재정렬을 자동 적용합니다. 두 키가 있으면
+`LOFIN_JEV_API_KEY`를 우선합니다. 키가 없으면 기존 검색을 그대로 사용합니다.
+설정을 바꾼 후 웹 서버를 재시작하세요. 초기화 실패 시 경고를 남기고 기존 검색으로 돌아갑니다.
+
+- 활성화 시 Qdrant 후보 24개를 가져와 기존 키워드 보정 후 후보별 관련성을 병렬 평가합니다.
+  비활성화 시 기존 `top_k * 3` 후보 수를 유지합니다. 활성화 시 반환 수는 최대 24개이며
+  임계값 필터 때문에 요청한 `top_k`보다 적을 수 있습니다.
+- `LOFIN_JEV_THRESHOLD`는 0~1의 유한한 숫자이며 기본값은 `0.6`입니다.
+  임계값 이상인 후보를 관련성 내림차순으로 정렬하고, 평가 실패 후보는 기존 순서대로 뒤에 둡니다.
+  성공했지만 임계값 미만인 후보는 제외합니다. 전부 실패하거나 통과 후보가 없으면
+  후보 전체의 기존 키워드 보정 순서를 반환합니다. 동점은 기존 순서를 유지합니다.
+- 결과의 `jev_relevant`는 관련성 확률(0~1), 평가 실패/비활성화는 `null`입니다.
+  `score`는 기존 벡터 점수와 키워드 보정값이며 Jev 확률로 덮어쓰지 않습니다.
+- 신규 패키지는 필요 없습니다. `JevReranker(timeout=10.0)`의 HTTP 타임아웃은 기본 10초이며
+  재시도하지 않습니다. 응답은 64 KiB로 제한하고 읽기 사이에 경과 시간을 확인합니다.
+  표준 라이브러리의 소켓 타임아웃이므로 DNS·접속·헤더 수신을 포함한 검색 전체의 엄격한
+  마감 시간은 아닙니다. 느린 서버/네트워크에서는 10초를 넘길 수 있습니다.
+  리다이렉트는 거부하고 HTTP 오류, 타임아웃, 잘못된 응답은 실패로 처리합니다.
+  로그에 키·검색어·정책 본문·API 응답은 기록하지 않습니다.
+
+**외부 전송과 비용:** 활성화 후 실제 검색 시 검색어와 후보 정책의 제목·설명·관련 구조화 본문이
+BeatAPI의 `https://api.beatapi.io/v1/systemone`으로 전송됩니다. 민감한 검색어나 비공개 정책은
+전송 권한과 제공자의 데이터 정책을 확인한 뒤 사용하세요. 키는 서버에만 보관하고 Git에 넣지 마세요.
+한 검색당 최대 24회 유료 요청이 발생합니다. 기본 모델은 `jev-1.14`이며 `LOFIN_JEV_MODEL`로 변경합니다.
+BeatAPI 공식 문서는 무료 모델이 2026-11-05 종료되었다고 안내합니다. 요금은 제공자 문서를 확인하세요.
+키 두 개를 모두 비우고 서버를 재시작하면 Jev 호출을 끌 수 있습니다.
+
+계약은 [BeatAPI Decisions API](https://docs.beatapi.io/decisions)와
+[TypeSafe System One](https://docs.typesafe.ai/api/system-one)을 기준으로 합니다.
+요청은 `model`, `state`, `questions.relevant`(`type: noul`)이며,
+응답은 `answers.relevant.type`과 `answers.relevant.noul`을 엄격히 검증합니다.
+임계값은 기본값일 뿐 실제 정책 검색에 대한 정확도 개선을 보장하지 않습니다.
+대표 검색어·정답 정책으로 재현율과 순위 품질을 별도로 평가하세요.
+
+테스트는 `python3 -m unittest discover -s tests -v`로 실행합니다.
+Jev 테스트는 `_post`를 모킹하므로 실제 키·네트워크·결제가 필요하지 않습니다.
