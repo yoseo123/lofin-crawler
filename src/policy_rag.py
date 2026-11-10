@@ -425,6 +425,7 @@ def format_search_result(item: dict[str, Any]) -> dict[str, Any]:
     raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
     return {
         "score": round(float(item.get("score") or 0.0), 6),
+        "jev_relevant": item.get("jev_relevant"),
         "policy_id": payload.get("policy_id"),
         "title": payload.get("title"),
         "year": payload.get("year"),
@@ -439,14 +440,19 @@ def format_search_result(item: dict[str, Any]) -> dict[str, Any]:
 
 
 class SimilarPolicySearch:
-    def __init__(self, *, embedding_client: Any, store: Any) -> None:
+    def __init__(self, *, embedding_client: Any, store: Any, reranker: Any = None) -> None:
         self.embedding_client = embedding_client
         self.store = store
+        self.reranker = reranker
 
     def search(self, query: str, *, top_k: int = DEFAULT_TOP_K, filters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         query_text = str(query or "").strip()
         if not query_text:
             raise ValueError("검색어를 입력하세요.")
         vector = self.embedding_client.embed(query_text)
-        candidates = self.store.search(vector, top_k=max(int(top_k) * 3, int(top_k)), filters=filters)
-        return [format_search_result(item) for item in rerank_results(query_text, candidates)[: int(top_k)]]
+        candidate_limit = 24 if self.reranker is not None else max(int(top_k) * 3, int(top_k))
+        candidates = self.store.search(vector, top_k=candidate_limit, filters=filters)
+        ranked = rerank_results(query_text, candidates)
+        if self.reranker is not None:
+            ranked = self.reranker.rerank(query_text, ranked)
+        return [format_search_result(item) for item in ranked[: int(top_k)]]
